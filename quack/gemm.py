@@ -3,6 +3,7 @@
 
 from typing import Optional
 
+import torch
 from torch import Tensor
 
 import cutlass.cute as cute
@@ -63,6 +64,7 @@ def _compile_gemm(
     rounding_mode,
     sr_seed_mode,
     has_trace_ptr,
+    has_splitk=False,
 ):
     sm_to_cls = {
         9: GemmDefaultSm90,
@@ -111,7 +113,10 @@ def _compile_gemm(
         sr_seed=fake_scalar(sr_seed_mode, dtype=Int32),
     )
     scheduler_args = make_fake_scheduler_args(
-        (is_dynamic_persistent and device_capacity[0] == 9), has_batch_idx_permute, l
+        (is_dynamic_persistent and device_capacity[0] == 9),
+        has_batch_idx_permute,
+        l,
+        has_split_k=has_splitk,
     )
     aidx_len = m if varlen_m else (k if varlen_k else None)
     varlen_args = make_fake_varlen_args(varlen_m, varlen_k, gather_A, aidx_len)
@@ -166,6 +171,7 @@ def gemm(
     sr_seed: int | Tensor = 0,
     use_tma_gather: bool = False,
     concat_layout: dict | None = None,
+    split_k: int = 1,  # number of K splits per output tile (turnstile reduction, SM100 only)
     trace_ptr=None,  # Optional Int64 from TraceSession.ptr
 ) -> None:
     varlen_m = cu_seqlens_m is not None
@@ -197,6 +203,17 @@ def gemm(
         assert tile_count_semaphore is not None, (
             "Dynamic persistent tile scheduler in SM90 requires a semaphore in GMEM"
         )
+
+    assert split_k >= 1, "split_k must be >= 1"
+    if split_k > 1:
+        assert device_capacity[0] in (10, 11), "split_k > 1 is only supported on SM100"
+        assert not varlen and not gather_A, "split_k > 1 does not support varlen/gather_A"
+        assert not add_to_output, "split_k > 1 does not support add_to_output"
+        assert tile_M != 256, "split_k > 1 does not support 2-CTA tiles (tile_M=256)"
+        assert persistent, "split_k > 1 requires the persistent scheduler"
+        # CLC persistence hands out work in no guaranteed order, which breaks the
+        # turnstile's forward-progress invariant; force the static persistent scheduler.
+        is_dynamic_persistent = False
 
     A_p, B_p, D_p, C_p = perm3d(A, B, D, C, varlen_m=varlen_m, varlen_k=varlen_k)
     a_major, b_major, d_major, c_major = get_majors(A_p, B_p, D_p, C_p)
@@ -240,6 +257,7 @@ def gemm(
         rounding_mode,
         sr_seed_mode,
         trace_ptr is not None,
+        split_k > 1,
     )
 
     from quack.cache_utils import COMPILE_ONLY
@@ -257,6 +275,18 @@ def gemm(
 
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
 
+    splitk_flags, splitk_ws = None, None
+    if split_k > 1:
+        l = A.shape[0] if A.ndim == 3 else 1
+        m, n = A.shape[-2], B.shape[-2]
+        num_tiles = ((m + tile_M - 1) // tile_M) * ((n + tile_N - 1) // tile_N) * l
+        ws_numel = num_tiles * tile_M * tile_N
+        assert ws_numel < 2**31, "split-K workspace indexing is 32-bit"
+        # Turnstile counters must start at zero; the f32 partials workspace needs no
+        # initialization (split 0 stores rather than accumulates).
+        splitk_flags = torch.zeros(num_tiles, dtype=torch.int32, device=A.device)
+        splitk_ws = torch.empty(ws_numel, dtype=torch.float32, device=A.device)
+
     epi_args = GemmDefaultEpiMixin.EpilogueArguments(
         alpha=scalar_arg(alpha, alpha_mode),
         beta=scalar_arg(beta, beta_mode),
@@ -271,6 +301,9 @@ def gemm(
         max_swizzle_size,
         tile_count_semaphore,
         batch_idx_permute,
+        split_k=split_k,
+        splitk_flags=splitk_flags,
+        splitk_ws=splitk_ws,
     )
     varlen_args = make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx)
 
