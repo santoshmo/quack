@@ -21,11 +21,11 @@ against cuBLAS via `torch.bmm`.
 
 | shape (m×n×k) | output tiles | cuBLAS | best quack | best split_k | vs cuBLAS | vs split_k=1 |
 |---|---|---|---|---|---|---|
-| 128×128×16384 | 1  | 20.2 TF / 26.6 µs | 16.5 TF / 32.6 µs | 16 | **0.82×** | 2.73× |
-| 128×128×65536 | 1  | 58.3 TF / 36.9 µs | 49.9 TF / 43.0 µs | 32 | **0.86×** | 7.42× |
-| 256×256×32768 | 4  | 110.6 TF / 38.8 µs | 109.7 TF / 39.1 µs | 16 | **0.99×** | 4.30× |
-| 512×512×16384 | 16 | 233.7 TF / 36.8 µs | 209.7 TF / 41.0 µs | 8 | **0.90×** | 2.24× |
-| 4096×4096×4096 | 1024 | 826.0 TF / 166 µs | 709.7 TF / 194 µs | 1 | 0.86× | 1.00× |
+| 128×128×16384 | 1  | 20.1 TF / 26.7 µs | 17.5 TF / 30.7 µs | 32 | **0.87×** | 2.91× |
+| 128×128×65536 | 1  | 58.2 TF / 36.9 µs | 55.3 TF / 38.8 µs | 32 | **0.95×** | 8.20× |
+| 256×256×32768 | 4  | 110.6 TF / 38.8 µs | 110.6 TF / 38.8 µs | 32 | **1.00×** | 4.33× |
+| 512×512×16384 | 16 | 233.2 TF / 36.8 µs | 200.6 TF / 42.8 µs | 8 | **0.86×** | 2.14× |
+| 4096×4096×4096 | 1024 | 825.7 TF / 166 µs | 710 TF / 194 µs | 1 | 0.86× | 1.00× |
 
 The last row uses `split_k=1` (split-K is counter-productive once the GPU is already
 full); its 0.86× reflects the dense mainloop, not split-K.
@@ -38,10 +38,10 @@ The earlier serial path (in-kernel turnstile reduction) is kept as
 
 | shape | serial best | parallel best |
 |---|---|---|
-| 128×128×16384 | 0.30× | **0.82×** |
-| 128×128×65536 | 0.18× | **0.86×** |
-| 256×256×32768 | 0.29× | **0.99×** |
-| 512×512×16384 | 0.40× | **0.90×** |
+| 128×128×16384 | 0.30× | **0.87×** |
+| 128×128×65536 | 0.18× | **0.95×** |
+| 256×256×32768 | 0.29× | **1.00×** |
+| 512×512×16384 | 0.40× | **0.86×** |
 
 ## How we got here
 
@@ -49,16 +49,32 @@ The earlier serial path (in-kernel turnstile reduction) is kept as
    serial turnstile — scales with `split_k` and removes the high-`split_k` blow-up.
 2. **Parallelized the reduce** over `(output tile, chunk)` — it had been one CTA per
    tile (266 µs at 128²×16384 sk=32); now ~µs-scale.
-3. **Unrolled the reduce accumulation + smaller reduce CTAs** — the reduce was
-   latency-bound (one outstanding load per thread); unrolling keeps many loads in
-   flight and spreading across more SMs adds bandwidth at high `split_k`. This made a
-   higher `split_k` worthwhile, which in turn fills the GEMM more.
+3. **Unrolled the reduce accumulation** — the reduce is latency-bound; unrolling keeps
+   several of each thread's slot loads in flight.
+4. **One element per reduce thread (`vec_width` 4→1)** — the decisive reduce win. The
+   reduce throughput scales with outstanding memory transactions = thread count, and
+   the thread count is `tile_mn / vec_width` per tile. Dropping the vector width to 1
+   quadruples it to `tile_mn` threads (matching cuBLAS's reduce thread count): the
+   reduce at 128²×65536 sk=32 went 13.1→8.6 µs (V=4/2/1 = 13.1/9.8/8.6 µs). A cheaper
+   reduce both stops it dominating *and* makes a higher `split_k` profitable (it's no
+   longer eaten by reduce growth), which fills the GEMM more — so the gain compounds.
+
+## Why not Stream-K
+
+An earlier hypothesis was that the single-tile shapes were GEMM-under-fill-limited and
+needed Stream-K. A sweep disproved it: higher `split_k` (more GEMM fill) **monotonically
+hurts** past the optimum (128²×65536: sk 16/32/64/128 = 6.70/7.08/6.23/4.73× vs sk=1),
+because the reduce grows faster than the fill helps (sk32→sk64: GEMM 20.0→15.6 µs but
+reduce 13.1→21.5 µs). The optimum sits at only 16–32 CTAs (11–22% of the 148 SMs), so
+the GPU is *not* full there — the binding constraint was the **reduce cost**, not fill.
+Stream-K on a single tile produces ~`G` contributors (≡ a huge `split_k`), landing deep
+in the *worse* region, so it cannot beat the current path on these shapes. The fix was a
+cheaper reduce (step 4 above), not Stream-K.
 
 ## Remaining gap
 
-On the single-output-tile shapes (128² rows, 0.82–0.86×) the bottleneck is now the
-**GEMM**, not the reduce: at the optimal `split_k` it runs on only `1 tile × split_k`
-CTAs (e.g. 16 CTAs at 128²×65536 sk=32) and under-fills the 148-SM GPU, while cuBLAS
-spreads the same work across ~64 CTAs. Raising `split_k` further regrows the reduce
-rather than helping. Closing this needs **Stream-K** (partition total MAC work evenly
-across a fixed ~all-SMs grid with partial-tile fixup), not a larger `split_k`.
+The single-tile reduce is now 8.6 µs vs cuBLAS's 3.8 µs; a split-axis (tree) reduction
+that adds threads beyond `tile_mn` could close more, at the cost of a two-pass combine.
+512²×16384 (16 tiles) sits at 0.86× because `vec_width=1` spawns many small reduce CTAs
+where the reduce is not the bottleneck; an adaptive `vec_width` or a `split_k`
+auto-heuristic would recover it.

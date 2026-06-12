@@ -35,12 +35,15 @@ class SplitKReduce:
     inside the slot; this kernel predicates the final D store by (M, N).
     """
 
-    # Small CTAs so a tile splits into many reduce CTAs (num_chunks = tile_mn/(64*4),
-    # e.g. 64 for a 128x128 tile vs 16 at 256 threads). Once the unrolled accumulation
-    # below hides per-thread load latency, spreading the reduce across more SMs pulls
-    # more HBM bandwidth -- at high split_k this is measurably faster than 256 threads.
+    # The reduce is latency-bound (per output element it sums `count` slots over HBM at
+    # well below peak BW), so throughput scales with the number of outstanding memory
+    # transactions, i.e. the thread count. Maximize it: small CTAs (num_threads=64) and
+    # one element per thread (vec_width=1) give tile_mn reduce threads per tile spread
+    # over many SMs -- measurably faster here than fewer threads with wider vector loads
+    # (V=1 vs 2 vs 4: reduce 8.6/9.8/13.1us at 128x128x65536 sk=32). The unrolled
+    # accumulation below keeps several of each thread's slot loads in flight.
     num_threads = 64
-    vec_width = 4  # fp32 elements per vectorized workspace load (16B)
+    vec_width = 1  # fp32 elements per thread (one outstanding load per slot per thread)
 
     def __init__(self, tile_m: int, tile_n: int):
         self.tile_m, self.tile_n = tile_m, tile_n
