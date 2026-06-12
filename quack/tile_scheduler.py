@@ -173,6 +173,7 @@ class TileScheduler:
         num_tiles_executed: Int32,
         current_batch_idx: Int32,
         num_work_idx_before_cur_batch: Int32,
+        current_k_split: Int32,
         sched_smem: Optional[cute.Tensor],
         scheduler_pipeline: Optional[cutlass.pipeline.PipelineAsync],
         pipeline_state: PipelineStateWAdvance,
@@ -185,6 +186,11 @@ class TileScheduler:
         self.num_tiles_executed = num_tiles_executed
         self._current_batch_idx = current_batch_idx
         self._num_work_idx_before_cur_batch = num_work_idx_before_cur_batch
+        # K-split index of the current work tile (always 0 when split-K is disabled).
+        # Carried as scheduler state rather than in WorkTileInfo.tile_idx: the DSL's
+        # WorkTileInfo has a rigid pytree schema (3 coord leaves + validity) and asserts
+        # on reconstruction if the K slot holds a dynamic value.
+        self.current_k_split = current_k_split
         self._sched_smem = sched_smem
         self._scheduler_pipeline = scheduler_pipeline
         self._pipeline_state = pipeline_state
@@ -256,6 +262,7 @@ class TileScheduler:
             Int32(0),  # num_tiles_executed
             Int32(0),  # current_batch_idx
             Int32(0),  # num_work_idx_before_cur_batch
+            Int32(0),  # current_k_split
             sched_smem,
             scheduler_pipeline,
             PipelineStateWAdvance(stages, Int32(0), Int32(0), Int32(0)),
@@ -357,7 +364,8 @@ class TileScheduler:
                     num_work = num_work * params.split_k_fdd.divisor
                 is_valid = work_idx < num_work
         pid_m, pid_n, batch_idx = Int32(0), Int32(0), Int32(0)
-        k_split = Int32(0) if const_expr(has_split_k) else None
+        if const_expr(has_split_k):
+            k_split = Int32(0)
         if is_valid:
             if const_expr(has_split_k):
                 # k_split is the fastest-varying component of the work index, so all
@@ -381,7 +389,11 @@ class TileScheduler:
                 if const_expr(params.batch_idx_permute is None)
                 else params.batch_idx_permute[bidz_]
             )
-        tile_coord_mnkl = (pid_m, pid_n, k_split, batch_idx)
+        if const_expr(has_split_k):
+            # The K slot of tile_coord_mnkl must stay statically None (WorkTileInfo's
+            # pytree schema is rigid), so k_split rides on the scheduler instead.
+            self.current_k_split = k_split
+        tile_coord_mnkl = (pid_m, pid_n, None, batch_idx)
         return cutlass.utils.WorkTileInfo(tile_coord_mnkl, is_valid)
 
     @cute.jit
@@ -389,7 +401,6 @@ class TileScheduler:
         params = self.params
         has_split_k = const_expr(params_has_split_k(params))
         pid_m, pid_n, batch_idx, is_valid = Int32(0), Int32(0), Int32(0), Boolean(False)
-        k_split = Int32(0) if const_expr(has_split_k) else None
         if const_expr(params.persistence_mode == PersistenceMode.NONE):
             pass
         # elif const_expr(params.persistence_mode == PersistenceMode.STATIC):
@@ -409,12 +420,13 @@ class TileScheduler:
             self._pipeline_state.advance()
             if const_expr(has_split_k):
                 # k_split is packed into the upper bits of the validity word (the smem
-                # relay only carries 4 ints per stage).
+                # relay only carries 4 ints per stage) and rides on the scheduler, not
+                # in tile_coord_mnkl (WorkTileInfo's pytree schema is rigid).
                 is_valid = Boolean(is_valid_i32 & 1)
-                k_split = is_valid_i32 >> 1
+                self.current_k_split = is_valid_i32 >> 1
             else:
                 is_valid = Boolean(is_valid_i32)
-        tile_coord_mnkl = (pid_m, pid_n, k_split, batch_idx)
+        tile_coord_mnkl = (pid_m, pid_n, None, batch_idx)
         return cutlass.utils.WorkTileInfo(tile_coord_mnkl, Boolean(is_valid))
 
     # @cute.jit
@@ -499,9 +511,9 @@ class TileScheduler:
             self._scheduler_pipeline.producer_acquire(pipeline_state_producer)
             valid_field = Int32(work_tile_info.is_valid_tile)
             if const_expr(params_has_split_k(params)):
-                # Pack k_split into the upper bits of the validity word; unpacked in
-                # get_current_work.
-                valid_field = valid_field | (work_tile_info.tile_idx[2] << 1)
+                # Pack k_split (set by _delinearize_work_idx just before this call) into
+                # the upper bits of the validity word; unpacked in get_current_work.
+                valid_field = valid_field | (self.current_k_split << 1)
             sched_data = [
                 work_tile_info.tile_idx[0],
                 work_tile_info.tile_idx[1],
@@ -585,6 +597,7 @@ class TileScheduler:
             self.num_tiles_executed,
             self._current_batch_idx,
             self._num_work_idx_before_cur_batch,
+            self.current_k_split,
             self._sched_smem,
             self._scheduler_pipeline,
             self._pipeline_state,
@@ -603,6 +616,7 @@ class TileScheduler:
                 self.num_tiles_executed,
                 self._current_batch_idx,
                 self._num_work_idx_before_cur_batch,
+                self.current_k_split,
                 self._sched_smem,
                 self._scheduler_pipeline,
                 self._pipeline_state,
@@ -714,6 +728,7 @@ class TriangularTileScheduler(TileScheduler):
             Int32(0),  # num_tiles_executed
             Int32(0),  # current_batch_idx
             Int32(0),  # num_work_idx_before_cur_batch
+            Int32(0),  # current_k_split
             sched_smem,
             scheduler_pipeline,
             PipelineStateWAdvance(stages, Int32(0), Int32(0), Int32(0)),
@@ -921,6 +936,7 @@ class VarlenMTileScheduler(TileScheduler):
         num_tiles_executed: Int32,
         current_batch_idx: Int32,
         num_work_idx_before_cur_batch: Int32,
+        current_k_split: Int32,
         sched_smem: Optional[cute.Tensor],
         scheduler_pipeline: Optional[cutlass.pipeline.PipelineAsync],
         pipeline_state: PipelineStateWAdvance,
@@ -933,6 +949,11 @@ class VarlenMTileScheduler(TileScheduler):
         self.num_tiles_executed = num_tiles_executed
         self._current_batch_idx = current_batch_idx
         self._num_work_idx_before_cur_batch = num_work_idx_before_cur_batch
+        # K-split index of the current work tile (always 0 when split-K is disabled).
+        # Carried as scheduler state rather than in WorkTileInfo.tile_idx: the DSL's
+        # WorkTileInfo has a rigid pytree schema (3 coord leaves + validity) and asserts
+        # on reconstruction if the K slot holds a dynamic value.
+        self.current_k_split = current_k_split
         self._sched_smem = sched_smem
         self._scheduler_pipeline = scheduler_pipeline
         self._pipeline_state = pipeline_state
@@ -986,6 +1007,7 @@ class VarlenMTileScheduler(TileScheduler):
             Int32(0),  # num_tiles_executed
             Int32(0),  # current_batch_idx
             Int32(0),  # num_work_idx_before_cur_batch
+            Int32(0),  # current_k_split
             sched_smem,
             scheduler_pipeline,
             PipelineStateWAdvance(stages, Int32(0), Int32(0), Int32(0)),

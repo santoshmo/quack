@@ -1209,7 +1209,7 @@ class GemmSm100(GemmSm90):
                     )
                 k_tile_cnt = cute.ceil_div(len_k, self.cta_tile_shape_mnk[2])
                 k_tile_start, k_tile_cnt = self.splitk_k_tile_range(
-                    tile_sched_params, tile_coord_mnkl[2], k_tile_cnt
+                    tile_sched_params, tile_scheduler.current_k_split, k_tile_cnt
                 )
                 tctx.b("tma_load")
                 if const_expr(not self.gather_A):
@@ -1381,7 +1381,10 @@ class GemmSm100(GemmSm90):
                         )
                     else:
                         # Only the final split runs the epilogue and consumes C
-                        if tile_coord_mnkl[2] == tile_sched_params.split_k_fdd.divisor - 1:
+                        if (
+                            tile_scheduler.current_k_split
+                            == tile_sched_params.split_k_fdd.divisor - 1
+                        ):
                             epi_producer_state, do_epi_load_barrier_wait = self._epi_load_C_tile(
                                 tma_atom_c,
                                 mC_mnl,
@@ -1480,7 +1483,7 @@ class GemmSm100(GemmSm90):
                 k_len = varlen_manager.len_k(batch_idx)
                 k_tile_cnt = cute.ceil_div(k_len, self.mma_tiler[2])
                 _, k_tile_cnt = self.splitk_k_tile_range(
-                    tile_sched_params, tile_coord_mnkl[2], k_tile_cnt
+                    tile_sched_params, tile_scheduler.current_k_split, k_tile_cnt
                 )
                 # Set tensor memory buffer for current tile
                 # (MMA, MMA_M, MMA_N)
@@ -1649,17 +1652,19 @@ class GemmSm100(GemmSm90):
                     )
                     k_tile_cnt = cute.ceil_div(k_len, self.mma_tiler[2])
                     _, k_tile_cnt = self.splitk_k_tile_range(
-                        tile_sched_params, tile_coord_mnkl[2], k_tile_cnt
+                        tile_sched_params, tile_scheduler.current_k_split, k_tile_cnt
                     )
                     # Splits that got no k tiles (split_k > total k tiles) contribute zeros
                     clear_acc = k_tile_cnt == 0
-                    is_final_split = tile_coord_mnkl[2] == tile_sched_params.split_k_fdd.divisor - 1
+                    is_final_split = (
+                        tile_scheduler.current_k_split == tile_sched_params.split_k_fdd.divisor - 1
+                    )
                     splitk_flag_ptr, splitk_tile_idx = self.splitk_tile_slot(
                         tile_sched_params, tile_coord_mnkl, mD_mnl
                     )
                     # Turnstile: wait until all preceding splits of this tile have
                     # accumulated their partials into the workspace
-                    self.splitk_wait(splitk_flag_ptr, tile_coord_mnkl[2], epi_tidx)
+                    self.splitk_wait(splitk_flag_ptr, tile_scheduler.current_k_split, epi_tidx)
                 load_acc_subtile = partial(
                     self.epi_load_acc_subtile,
                     tiled_copy_t2r,
@@ -1743,7 +1748,7 @@ class GemmSm100(GemmSm90):
                         self.splitk_store_partials(
                             tile_sched_params,
                             splitk_tile_idx,
-                            tile_coord_mnkl[2],
+                            tile_scheduler.current_k_split,
                             load_acc_subtile,
                             tRS_rD,
                             tTR_rD,
