@@ -23,7 +23,7 @@ from quack.gemm_tvm_ffi_utils import div_for_dtype
 
 
 class SplitKReduce:
-    """One CTA per output tile; each CTA sums that tile's `split_k` workspace slots.
+    """One CTA per (output tile, chunk); each CTA sums its chunk across `split_k` slots.
 
     Workspace layout (written by the GEMM kernel's parallel split-K path): slot
     `tile_idx * split_k + s` holds a row-major (tile_m, tile_n) fp32 partial tile,
@@ -55,8 +55,12 @@ class SplitKReduce:
     ):
         ntile_m = cute.ceil_div(cute.size(mD, mode=[0]), self.tile_m)
         ntile_n = cute.ceil_div(cute.size(mD, mode=[1]), self.tile_n)
+        # One CTA per (output tile, chunk): a tile's chunks reduce on separate CTAs
+        # so the kernel fills the GPU instead of serializing on one CTA per tile.
+        # block_idx.z packs (l, chunk) -> grid.z = L * num_chunks.
+        num_chunks = (self.tile_m * self.tile_n) // (self.num_threads * self.vec_width)
         self.kernel(mWS, mD, mC, alpha, beta, mRowVec, mColVec, split_k, ntile_n).launch(
-            grid=[ntile_m, ntile_n, cute.size(mD, mode=[2])],
+            grid=[ntile_m, ntile_n, cute.size(mD, mode=[2]) * num_chunks],
             block=[self.num_threads, 1, 1],
             stream=stream,
         )
@@ -75,12 +79,15 @@ class SplitKReduce:
         ntile_n: Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
-        bid_m, bid_n, bid_l = cute.arch.block_idx()
+        bid_m, bid_n, bid_lc = cute.arch.block_idx()
         tile_m = const_expr(self.tile_m)
         tile_n = const_expr(self.tile_n)
         tile_mn = const_expr(tile_m * tile_n)
         V = const_expr(self.vec_width)
         num_chunks = const_expr(tile_mn // (self.num_threads * V))
+        # block_idx.z packs (l, chunk): this CTA reduces one chunk of one output tile.
+        bid_l = bid_lc // num_chunks
+        chunk = bid_lc % num_chunks
 
         len_m = cute.size(mD, mode=[0])
         len_n = cute.size(mD, mode=[1])
@@ -96,41 +103,40 @@ class SplitKReduce:
             beta_v = utils.load_scalar_or_pointer(beta)
 
         rAcc = cute.make_rmem_tensor(V, Float32)
-        for chunk in cutlass.range_constexpr(num_chunks):
-            flat = (chunk * self.num_threads + tidx) * V
-            # Sum the split slices in fixed ascending order (deterministic)
-            tWS = cute.make_tensor(slot_base + flat, cute.make_layout(V))
-            cute.autovec_copy(tWS, rAcc)
-            for s in cutlass.range(1, split_k, unroll=1):
-                tWS_s = cute.make_tensor(slot_base + s * tile_mn + flat, cute.make_layout(V))
-                rAcc.store(rAcc.load() + tWS_s.load())
-            # The vector spans one row of the slot (tile_n % V == 0)
-            m = m0 + flat // tile_n
-            n_base = n0 + flat % tile_n
-            if m < len_m:
-                colvec_val = Float32(0.0)
-                if const_expr(mColVec is not None):
-                    colvec_val = Float32(mColVec[bid_l, m])
-                # Epilogue + predicated store, elementwise (D/C layout-agnostic).
-                # Same op order as GemmDefaultEpiMixin.epi_visit_subtile:
-                # alpha * acc, then (+ beta * C | + C), then rowvec/colvec bias.
-                for i in cutlass.range_constexpr(V):
-                    n = n_base + i
-                    if n < len_n:
-                        val = Float32(rAcc[i])
-                        if const_expr(alpha is not None):
-                            val = val * alpha_v
-                        if const_expr(mC is not None):
-                            c_val = Float32(mC[m, n, bid_l])
-                            if const_expr(beta is not None):
-                                val += beta_v * c_val
-                            else:
-                                val += c_val
-                        if const_expr(mRowVec is not None):
-                            val += Float32(mRowVec[bid_l, n])
-                        if const_expr(mColVec is not None):
-                            val += colvec_val
-                        mD[m, n, bid_l] = mD.element_type(val)
+        flat = (chunk * self.num_threads + tidx) * V
+        # Sum the split slices in fixed ascending order (deterministic)
+        tWS = cute.make_tensor(slot_base + flat, cute.make_layout(V))
+        cute.autovec_copy(tWS, rAcc)
+        for s in cutlass.range(1, split_k, unroll=1):
+            tWS_s = cute.make_tensor(slot_base + s * tile_mn + flat, cute.make_layout(V))
+            rAcc.store(rAcc.load() + tWS_s.load())
+        # The vector spans one row of the slot (tile_n % V == 0)
+        m = m0 + flat // tile_n
+        n_base = n0 + flat % tile_n
+        if m < len_m:
+            colvec_val = Float32(0.0)
+            if const_expr(mColVec is not None):
+                colvec_val = Float32(mColVec[bid_l, m])
+            # Epilogue + predicated store, elementwise (D/C layout-agnostic).
+            # Same op order as GemmDefaultEpiMixin.epi_visit_subtile:
+            # alpha * acc, then (+ beta * C | + C), then rowvec/colvec bias.
+            for i in cutlass.range_constexpr(V):
+                n = n_base + i
+                if n < len_n:
+                    val = Float32(rAcc[i])
+                    if const_expr(alpha is not None):
+                        val = val * alpha_v
+                    if const_expr(mC is not None):
+                        c_val = Float32(mC[m, n, bid_l])
+                        if const_expr(beta is not None):
+                            val += beta_v * c_val
+                        else:
+                            val += c_val
+                    if const_expr(mRowVec is not None):
+                        val += Float32(mRowVec[bid_l, n])
+                    if const_expr(mColVec is not None):
+                        val += colvec_val
+                    mD[m, n, bid_l] = mD.element_type(val)
 
 
 @jit_cache
