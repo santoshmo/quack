@@ -13,6 +13,7 @@ import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
 from cutlass.cute.runtime import make_ptr
 
+import torch
 from torch import Tensor
 
 import quack.utils as utils
@@ -23,12 +24,15 @@ from quack.gemm_tvm_ffi_utils import div_for_dtype
 
 
 class SplitKReduce:
-    """One CTA per (output tile, chunk); each CTA sums its chunk across `split_k` slots.
+    """One CTA per (output tile, chunk); each CTA sums its chunk across the tile's slots.
 
-    Workspace layout (written by the GEMM kernel's parallel split-K path): slot
-    `tile_idx * split_k + s` holds a row-major (tile_m, tile_n) fp32 partial tile,
-    where tile_idx = (tile_m_idx * ntile_n + tile_n_idx) * L + l. Edge tiles are
-    padded inside the slot; this kernel predicates the final D store by (M, N).
+    Workspace layout: tile `tile_idx` owns `tile_count[tile_idx]` consecutive slots
+    starting at `tile_first_slot[tile_idx]` (a host-built prefix sum); each slot holds a
+    row-major (tile_m, tile_n) fp32 partial, where tile_idx =
+    (tile_m_idx * ntile_n + tile_n_idx) * L + l. The fixed split-K path passes uniform
+    tables (count = split_k, first_slot = tile_idx * split_k); Stream-K will pass a
+    variable, data-dependent count per tile into the same kernel. Edge tiles are padded
+    inside the slot; this kernel predicates the final D store by (M, N).
     """
 
     # Small CTAs so a tile splits into many reduce CTAs (num_chunks = tile_mn/(64*4),
@@ -47,14 +51,15 @@ class SplitKReduce:
     @cute.jit
     def __call__(
         self,
-        mWS: cute.Tensor,  # (split_k * num_tiles * tile_m * tile_n,) f32
+        mWS: cute.Tensor,  # (total_contributors * tile_m * tile_n,) f32
         mD: cute.Tensor,  # (M, N, L)
         mC: Optional[cute.Tensor],  # (M, N, L)
         alpha: Optional[Float32 | cute.Pointer],
         beta: Optional[Float32 | cute.Pointer],
         mRowVec: Optional[cute.Tensor],  # (L, N)
         mColVec: Optional[cute.Tensor],  # (L, M)
-        split_k: Int32,
+        mTileFirstSlot: cute.Tensor,  # (num_tiles,) i32: first slot owned by each tile
+        mTileCount: cute.Tensor,  # (num_tiles,) i32: contributors per tile
         stream: cuda.CUstream,
     ):
         ntile_m = cute.ceil_div(cute.size(mD, mode=[0]), self.tile_m)
@@ -63,7 +68,9 @@ class SplitKReduce:
         # so the kernel fills the GPU instead of serializing on one CTA per tile.
         # block_idx.z packs (l, chunk) -> grid.z = L * num_chunks.
         num_chunks = (self.tile_m * self.tile_n) // (self.num_threads * self.vec_width)
-        self.kernel(mWS, mD, mC, alpha, beta, mRowVec, mColVec, split_k, ntile_n).launch(
+        self.kernel(
+            mWS, mD, mC, alpha, beta, mRowVec, mColVec, mTileFirstSlot, mTileCount, ntile_n
+        ).launch(
             grid=[ntile_m, ntile_n, cute.size(mD, mode=[2]) * num_chunks],
             block=[self.num_threads, 1, 1],
             stream=stream,
@@ -79,7 +86,8 @@ class SplitKReduce:
         beta: Optional[Float32 | cute.Pointer],
         mRowVec: Optional[cute.Tensor],
         mColVec: Optional[cute.Tensor],
-        split_k: Int32,
+        mTileFirstSlot: cute.Tensor,
+        mTileCount: cute.Tensor,
         ntile_n: Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
@@ -97,7 +105,12 @@ class SplitKReduce:
         len_n = cute.size(mD, mode=[1])
         num_l = cute.size(mD, mode=[2])
         tile_idx = (bid_m * ntile_n + bid_n) * num_l + bid_l
-        slot_base = mWS.iterator + tile_idx * split_k * tile_mn
+        # Variable per-tile contributor count + first-slot offset (a host-built prefix
+        # sum) generalize the fixed `tile_idx * split_k` of the uniform split-K path, so
+        # Stream-K (data-dependent contributors per tile) can reuse this reduce kernel.
+        first_slot = mTileFirstSlot[tile_idx]
+        count = mTileCount[tile_idx]
+        slot_base = mWS.iterator + first_slot * tile_mn
         m0, n0 = bid_m * tile_m, bid_n * tile_n
 
         alpha_v, beta_v = Float32(1.0), Float32(1.0)
@@ -114,7 +127,7 @@ class SplitKReduce:
         # loads in flight per thread. Unrolling preserves the add order (numerics).
         tWS = cute.make_tensor(slot_base + flat, cute.make_layout(V))
         cute.autovec_copy(tWS, rAcc)
-        for s in cutlass.range(1, split_k, unroll=8):
+        for s in cutlass.range(1, count, unroll=8):
             tWS_s = cute.make_tensor(slot_base + s * tile_mn + flat, cute.make_layout(V))
             rAcc.store(rAcc.load() + tWS_s.load())
         # The vector spans one row of the slot (tile_n % V == 0)
@@ -196,6 +209,8 @@ def _compile_splitk_reduce(
         if colvec_dtype is not None
         else None
     )
+    mTileFirstSlot = fake_tensor(Int32, (cute.sym_int(),), leading_dim=0, divisibility=1)
+    mTileCount = fake_tensor(Int32, (cute.sym_int(),), leading_dim=0, divisibility=1)
     return cute.compile(
         SplitKReduce(tile_m, tile_n),
         mWS,
@@ -205,7 +220,8 @@ def _compile_splitk_reduce(
         fake_scalar(beta_mode),
         mRowVec,
         mColVec,
-        Int32(1),  # split_k
+        mTileFirstSlot,
+        mTileCount,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
     )
@@ -234,15 +250,35 @@ def compile_splitk_reduce(D, C, alpha, beta, rowvec, colvec, tile_m, tile_n):
     )
 
 
+_uniform_tables_cache: dict = {}
+
+
+def uniform_splitk_tables(num_tiles: int, split_k: int, device) -> tuple[Tensor, Tensor]:
+    """(tile_first_slot, tile_count) for the fixed split-K layout: every tile has exactly
+    `split_k` contributors at slots [t*split_k, (t+1)*split_k). Cached per
+    (num_tiles, split_k, device) so the parallel split-K path pays no per-call build cost.
+    Stream-K will instead build non-uniform tables and feed the same reduce kernel."""
+    dev_key = device.index if device.type == "cuda" else -1
+    key = (num_tiles, split_k, dev_key)
+    cached = _uniform_tables_cache.get(key)
+    if cached is None:
+        first = torch.arange(0, num_tiles * split_k, split_k, dtype=torch.int32, device=device)
+        count = torch.full((num_tiles,), split_k, dtype=torch.int32, device=device)
+        cached = (first, count)
+        _uniform_tables_cache[key] = cached
+    return cached
+
+
 def splitk_reduce(
-    ws: Tensor,  # (split_k * num_tiles * tile_m * tile_n,) f32 partials
+    ws: Tensor,  # (total_contributors * tile_m * tile_n,) f32 partials
     D: Tensor,  # (M, N, L), post-perm3d layout
     C: Optional[Tensor],  # (M, N, L), post-perm3d layout
     alpha: float | Tensor,
     beta: float | Tensor,
     rowvec: Optional[Tensor],  # (L, N)
     colvec: Optional[Tensor],  # (L, M)
-    split_k: int,
+    tile_first_slot: Tensor,  # (num_tiles,) i32
+    tile_count: Tensor,  # (num_tiles,) i32
     tile_m: int,
     tile_n: int,
 ) -> None:
@@ -271,5 +307,6 @@ def splitk_reduce(
         scalar_arg(beta, beta_mode),
         rowvec,
         colvec,
-        split_k,
+        tile_first_slot,
+        tile_count,
     )

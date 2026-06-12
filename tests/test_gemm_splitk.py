@@ -154,3 +154,56 @@ def test_gemm_splitk_deterministic(split_k, mode):
     for _ in range(5):
         _run_gemm(A, B, D2, split_k, mode)
         assert torch.equal(D1, D2), "split-K reduction must be run-to-run deterministic"
+
+
+# ── Table-driven reduce: variable contributors per tile (Stream-K precursor) ──
+# Drive the reduce kernel DIRECTLY with a NON-uniform contributor layout to prove the
+# per-tile (first_slot, count) prefix-sum indirection and the (m_idx, n_idx, l) tile
+# enumeration are correct independently of the GEMM. The uniform split-K path uses
+# first_slot = tile_idx * split_k (order-independent) and so cannot exercise this; it is
+# the slot-index identity Stream-K will rely on once contributor counts vary per tile.
+@pytest.mark.parametrize("d_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("with_C", [False, True])
+@pytest.mark.parametrize("l", [1, 2])
+def test_splitk_reduce_variable_contributors(l, with_C, d_dtype):
+    from quack.gemm_splitk_reduce import splitk_reduce
+
+    torch.manual_seed(0)
+    tile_m = tile_n = 128
+    ntile_m, ntile_n = 2, 3  # multi-tile, non-square raster (exact multiples, no edges)
+    M, N = ntile_m * tile_m, ntile_n * tile_n
+    num_tiles = ntile_m * ntile_n * l
+
+    # Distinct per-tile contributor counts (>=1) so the prefix-sum offset actually matters.
+    counts = torch.tensor([1, 5, 2, 4, 3, 1, 6, 2, 1, 3, 5, 2][:num_tiles], dtype=torch.int32)
+    first = torch.zeros(num_tiles, dtype=torch.int32)
+    if num_tiles > 1:
+        first[1:] = torch.cumsum(counts.to(torch.int64), 0)[:-1].to(torch.int32)
+    total = int(counts.sum().item())
+    tile_first_slot, tile_count = first.cuda(), counts.cuda()
+
+    ws = torch.randn(total, tile_m, tile_n, dtype=torch.float32, device="cuda")
+    # n-major (M, N, L) layout, matching what perm3d hands the kernel in gemm().
+    D = torch.empty(l, M, N, dtype=d_dtype, device="cuda").permute(1, 2, 0)
+    C = torch.randn(l, M, N, dtype=d_dtype, device="cuda").permute(1, 2, 0) if with_C else None
+    alpha, beta = (0.5, 0.7) if with_C else (1.0, 1.0)
+
+    # Reference: sum each tile's own slots, then the kernel's epilogue order.
+    ref = torch.zeros(M, N, l, dtype=torch.float32, device="cuda")
+    for t in range(num_tiles):
+        li, rem = t % l, t // l
+        ni, mi = rem % ntile_n, rem // ntile_n
+        f, c = int(first[t]), int(counts[t])
+        part = ws[f : f + c].sum(0)
+        if alpha != 1.0:
+            part = part * alpha
+        rs, re, cs, ce = mi * tile_m, (mi + 1) * tile_m, ni * tile_n, (ni + 1) * tile_n
+        if with_C:
+            part = part + beta * C[rs:re, cs:ce, li].float()
+        ref[rs:re, cs:ce, li] = part
+
+    splitk_reduce(
+        ws.reshape(-1), D, C, alpha, beta, None, None,
+        tile_first_slot, tile_count, tile_m, tile_n,
+    )
+    torch.testing.assert_close(D.float(), ref, atol=ATOL[d_dtype], rtol=RTOL)

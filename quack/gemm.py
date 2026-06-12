@@ -20,7 +20,7 @@ from quack.gemm_default_epi import (
     GemmDefaultSm120,
 )
 from quack.rounding import RoundingMode
-from quack.gemm_splitk_reduce import compile_splitk_reduce, splitk_reduce
+from quack.gemm_splitk_reduce import compile_splitk_reduce, splitk_reduce, uniform_splitk_tables
 from quack.gemm_tvm_ffi_utils import (
     get_majors,
     get_dtypes,
@@ -303,7 +303,7 @@ def gemm(
 
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
 
-    splitk_flags, splitk_ws = None, None
+    splitk_flags, splitk_ws, splitk_tables = None, None, None
     if split_k > 1:
         l = A.shape[0] if A.ndim == 3 else 1
         m, n = A.shape[-2], B.shape[-2]
@@ -316,6 +316,11 @@ def gemm(
         if not splitk_parallel:
             splitk_flags = torch.zeros(num_tiles, dtype=torch.int32, device=A.device)
         splitk_ws = torch.empty(ws_numel, dtype=torch.float32, device=A.device)
+        if splitk_parallel:
+            # Table-driven reduce: each tile owns `count` slots from `first_slot`. The
+            # fixed split-K layout is the uniform case (count=split_k); the reduce kernel
+            # is otherwise agnostic to how the partials were partitioned (Stream-K-ready).
+            splitk_tables = uniform_splitk_tables(num_tiles, split_k, A.device)
 
     # In parallel split-K, D/C/alpha/beta/bias belong to the reduce kernel, not the GEMM
     epi_args = GemmDefaultEpiMixin.EpilogueArguments(
@@ -357,6 +362,17 @@ def gemm(
         compiled_fn(A_p, B_p, gemm_D_p, gemm_C_p, epi_args, scheduler_args, varlen_args, trace_ptr)
     if splitk_parallel:
         # Deterministic parallel reduction of the per-split partials + epilogue
+        tile_first_slot, tile_count = splitk_tables
         splitk_reduce(
-            splitk_ws, D_p, C_p, alpha, beta, rowvec_bias, colvec_bias, split_k, tile_M, tile_N
+            splitk_ws,
+            D_p,
+            C_p,
+            alpha,
+            beta,
+            rowvec_bias,
+            colvec_bias,
+            tile_first_slot,
+            tile_count,
+            tile_M,
+            tile_N,
         )
