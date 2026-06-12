@@ -1,0 +1,262 @@
+# Copyright (c) 2026, QuACK contributors.
+# Second kernel of parallel split-K GEMM: sums the per-split fp32 partial tiles written
+# by the GEMM kernel (fixed ascending split order -> run-to-run deterministic) and
+# applies the default epilogue (alpha, beta*C, rowvec/colvec bias) while converting to
+# the output dtype. Mirrors cuBLAS's splitKreduce_kernel.
+
+from typing import Optional
+
+import cuda.bindings.driver as cuda
+
+import cutlass
+import cutlass.cute as cute
+from cutlass import Float32, Int32, const_expr
+from cutlass.cute.runtime import make_ptr
+
+from torch import Tensor
+
+import quack.utils as utils
+from quack.cache_utils import jit_cache
+from quack.compile_utils import make_fake_tensor as fake_tensor
+from quack.cute_dsl_utils import torch2cute_dtype_map
+from quack.gemm_tvm_ffi_utils import div_for_dtype
+
+
+class SplitKReduce:
+    """One CTA per output tile; each CTA sums that tile's `split_k` workspace slots.
+
+    Workspace layout (written by the GEMM kernel's parallel split-K path): slot
+    `tile_idx * split_k + s` holds a row-major (tile_m, tile_n) fp32 partial tile,
+    where tile_idx = (tile_m_idx * ntile_n + tile_n_idx) * L + l. Edge tiles are
+    padded inside the slot; this kernel predicates the final D store by (M, N).
+    """
+
+    num_threads = 256
+    vec_width = 4  # fp32 elements per vectorized workspace load (16B)
+
+    def __init__(self, tile_m: int, tile_n: int):
+        self.tile_m, self.tile_n = tile_m, tile_n
+        # A vector never straddles a row of the slot, and chunks tile the slot exactly
+        assert tile_n % self.vec_width == 0
+        assert (tile_m * tile_n) % (self.num_threads * self.vec_width) == 0
+
+    @cute.jit
+    def __call__(
+        self,
+        mWS: cute.Tensor,  # (split_k * num_tiles * tile_m * tile_n,) f32
+        mD: cute.Tensor,  # (M, N, L)
+        mC: Optional[cute.Tensor],  # (M, N, L)
+        alpha: Optional[Float32 | cute.Pointer],
+        beta: Optional[Float32 | cute.Pointer],
+        mRowVec: Optional[cute.Tensor],  # (L, N)
+        mColVec: Optional[cute.Tensor],  # (L, M)
+        split_k: Int32,
+        stream: cuda.CUstream,
+    ):
+        ntile_m = cute.ceil_div(cute.size(mD, mode=[0]), self.tile_m)
+        ntile_n = cute.ceil_div(cute.size(mD, mode=[1]), self.tile_n)
+        self.kernel(mWS, mD, mC, alpha, beta, mRowVec, mColVec, split_k, ntile_n).launch(
+            grid=[ntile_m, ntile_n, cute.size(mD, mode=[2])],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mWS: cute.Tensor,
+        mD: cute.Tensor,
+        mC: Optional[cute.Tensor],
+        alpha: Optional[Float32 | cute.Pointer],
+        beta: Optional[Float32 | cute.Pointer],
+        mRowVec: Optional[cute.Tensor],
+        mColVec: Optional[cute.Tensor],
+        split_k: Int32,
+        ntile_n: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        bid_m, bid_n, bid_l = cute.arch.block_idx()
+        tile_m = const_expr(self.tile_m)
+        tile_n = const_expr(self.tile_n)
+        tile_mn = const_expr(tile_m * tile_n)
+        V = const_expr(self.vec_width)
+        num_chunks = const_expr(tile_mn // (self.num_threads * V))
+
+        len_m = cute.size(mD, mode=[0])
+        len_n = cute.size(mD, mode=[1])
+        num_l = cute.size(mD, mode=[2])
+        tile_idx = (bid_m * ntile_n + bid_n) * num_l + bid_l
+        slot_base = mWS.iterator + tile_idx * split_k * tile_mn
+        m0, n0 = bid_m * tile_m, bid_n * tile_n
+
+        alpha_v, beta_v = Float32(1.0), Float32(1.0)
+        if const_expr(alpha is not None):
+            alpha_v = utils.load_scalar_or_pointer(alpha)
+        if const_expr(beta is not None):
+            beta_v = utils.load_scalar_or_pointer(beta)
+
+        rAcc = cute.make_rmem_tensor(V, Float32)
+        for chunk in cutlass.range_constexpr(num_chunks):
+            flat = (chunk * self.num_threads + tidx) * V
+            # Sum the split slices in fixed ascending order (deterministic)
+            tWS = cute.make_tensor(slot_base + flat, cute.make_layout(V))
+            cute.autovec_copy(tWS, rAcc)
+            for s in cutlass.range(1, split_k, unroll=1):
+                tWS_s = cute.make_tensor(slot_base + s * tile_mn + flat, cute.make_layout(V))
+                rAcc.store(rAcc.load() + tWS_s.load())
+            # The vector spans one row of the slot (tile_n % V == 0)
+            m = m0 + flat // tile_n
+            n_base = n0 + flat % tile_n
+            if m < len_m:
+                colvec_val = Float32(0.0)
+                if const_expr(mColVec is not None):
+                    colvec_val = Float32(mColVec[bid_l, m])
+                # Epilogue + predicated store, elementwise (D/C layout-agnostic).
+                # Same op order as GemmDefaultEpiMixin.epi_visit_subtile:
+                # alpha * acc, then (+ beta * C | + C), then rowvec/colvec bias.
+                for i in cutlass.range_constexpr(V):
+                    n = n_base + i
+                    if n < len_n:
+                        val = Float32(rAcc[i])
+                        if const_expr(alpha is not None):
+                            val = val * alpha_v
+                        if const_expr(mC is not None):
+                            c_val = Float32(mC[m, n, bid_l])
+                            if const_expr(beta is not None):
+                                val += beta_v * c_val
+                            else:
+                                val += c_val
+                        if const_expr(mRowVec is not None):
+                            val += Float32(mRowVec[bid_l, n])
+                        if const_expr(mColVec is not None):
+                            val += colvec_val
+                        mD[m, n, bid_l] = mD.element_type(val)
+
+
+@jit_cache
+def _compile_splitk_reduce(
+    d_dtype,
+    c_dtype,
+    d_major,
+    c_major,
+    tile_m,
+    tile_n,
+    alpha_mode,
+    beta_mode,
+    rowvec_dtype,
+    colvec_dtype,
+):
+    m, n, l = cute.sym_int(), cute.sym_int(), cute.sym_int()
+
+    def fake_scalar(mode):
+        if mode == 0:
+            return None
+        elif mode == 1:
+            return Float32(1.0)
+        else:
+            return make_ptr(Float32, 0, cute.AddressSpace.gmem, assumed_align=4)
+
+    mWS = fake_tensor(Float32, (cute.sym_int(),), leading_dim=0, divisibility=4)
+    mD = fake_tensor(
+        d_dtype,
+        (m, n, l),
+        leading_dim=1 if d_major == "n" else 0,
+        divisibility=div_for_dtype(d_dtype),
+    )
+    mC = (
+        fake_tensor(
+            c_dtype,
+            (m, n, l),
+            leading_dim=1 if c_major == "n" else 0,
+            divisibility=div_for_dtype(c_dtype),
+        )
+        if c_dtype is not None
+        else None
+    )
+    mRowVec = (
+        fake_tensor(rowvec_dtype, (l, n), leading_dim=1, divisibility=4)
+        if rowvec_dtype is not None
+        else None
+    )
+    mColVec = (
+        fake_tensor(colvec_dtype, (l, m), leading_dim=1, divisibility=4)
+        if colvec_dtype is not None
+        else None
+    )
+    return cute.compile(
+        SplitKReduce(tile_m, tile_n),
+        mWS,
+        mD,
+        mC,
+        fake_scalar(alpha_mode),
+        fake_scalar(beta_mode),
+        mRowVec,
+        mColVec,
+        Int32(1),  # split_k
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
+    )
+
+
+def _scalar_modes(alpha, beta):
+    alpha_mode = 2 if isinstance(alpha, Tensor) else (1 if alpha != 1.0 else 0)
+    beta_mode = 2 if isinstance(beta, Tensor) else (1 if beta != 1.0 else 0)
+    return alpha_mode, beta_mode
+
+
+def compile_splitk_reduce(D, C, alpha, beta, rowvec, colvec, tile_m, tile_n):
+    """Compile (or fetch from cache) the reduce kernel for these tensor properties."""
+    alpha_mode, beta_mode = _scalar_modes(alpha, beta)
+    return _compile_splitk_reduce(
+        torch2cute_dtype_map[D.dtype],
+        torch2cute_dtype_map[C.dtype] if C is not None else None,
+        "n" if D.stride(1) == 1 else "m",
+        ("n" if C.stride(1) == 1 else "m") if C is not None else None,
+        tile_m,
+        tile_n,
+        alpha_mode,
+        beta_mode,
+        torch2cute_dtype_map[rowvec.dtype] if rowvec is not None else None,
+        torch2cute_dtype_map[colvec.dtype] if colvec is not None else None,
+    )
+
+
+def splitk_reduce(
+    ws: Tensor,  # (split_k * num_tiles * tile_m * tile_n,) f32 partials
+    D: Tensor,  # (M, N, L), post-perm3d layout
+    C: Optional[Tensor],  # (M, N, L), post-perm3d layout
+    alpha: float | Tensor,
+    beta: float | Tensor,
+    rowvec: Optional[Tensor],  # (L, N)
+    colvec: Optional[Tensor],  # (L, M)
+    split_k: int,
+    tile_m: int,
+    tile_n: int,
+) -> None:
+    compiled_fn = compile_splitk_reduce(D, C, alpha, beta, rowvec, colvec, tile_m, tile_n)
+
+    from quack.cache_utils import COMPILE_ONLY
+
+    if COMPILE_ONLY:
+        return
+
+    alpha_mode, beta_mode = _scalar_modes(alpha, beta)
+
+    def scalar_arg(scalar, mode):
+        if mode == 0:
+            return None
+        elif mode == 1:
+            return float(scalar)
+        else:
+            return scalar.data_ptr()
+
+    compiled_fn(
+        ws,
+        D,
+        C,
+        scalar_arg(alpha, alpha_mode),
+        scalar_arg(beta, beta_mode),
+        rowvec,
+        colvec,
+        split_k,
+    )

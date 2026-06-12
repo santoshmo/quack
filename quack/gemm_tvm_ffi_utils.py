@@ -66,6 +66,7 @@ def make_scheduler_args(
     split_k=1,
     splitk_flags=None,
     splitk_ws=None,
+    splitk_parallel=False,
 ):
     return TileSchedulerOptions(
         max_active_clusters=Int32(max_active_clusters),
@@ -78,10 +79,13 @@ def make_scheduler_args(
         split_k=Int32(split_k),
         splitk_flags=(splitk_flags.data_ptr() if splitk_flags is not None else None),
         splitk_ws=splitk_ws,
+        splitk_parallel=splitk_parallel,
     )
 
 
-def make_fake_scheduler_args(has_semaphore, has_batch_idx_permute, l_sym, has_split_k=False):
+def make_fake_scheduler_args(
+    has_semaphore, has_batch_idx_permute, l_sym, has_split_k=False, splitk_parallel=False
+):
     return TileSchedulerOptions(
         max_active_clusters=Int32(1),
         max_swizzle_size=Int32(8),
@@ -95,13 +99,16 @@ def make_fake_scheduler_args(has_semaphore, has_batch_idx_permute, l_sym, has_sp
         ),
         split_k=Int32(1),
         splitk_flags=(
-            make_ptr(Int32, 0, cute.AddressSpace.gmem, assumed_align=4) if has_split_k else None
+            make_ptr(Int32, 0, cute.AddressSpace.gmem, assumed_align=4)
+            if has_split_k and not splitk_parallel
+            else None
         ),
         splitk_ws=(
             fake_tensor(Float32, (cute.sym_int(),), leading_dim=0, divisibility=4)
             if has_split_k
             else None
         ),
+        splitk_parallel=splitk_parallel,
     )
 
 

@@ -61,10 +61,15 @@ class TileSchedulerOptions(NamedTuple):
     # Split-K: number of K splits per output tile (runtime value; > 1 only when the
     # flags/workspace buffers below are provided).
     split_k: Int32 = Int32(1)
-    # (num_tiles_m * num_tiles_n * L,) int32 turnstile counters, zero-initialized
+    # (num_tiles_m * num_tiles_n * L,) int32 turnstile counters, zero-initialized.
+    # Only used in serial (turnstile) mode; None in parallel mode.
     splitk_flags: Optional[cute.Pointer] = None
-    # (num_tiles_m * num_tiles_n * L * tile_m * tile_n,) f32 partial-accumulator workspace
+    # f32 partial-accumulator workspace. Serial mode: one tile_m*tile_n slot per output
+    # tile (fragment order). Parallel mode: split_k slots per output tile (row-major).
     splitk_ws: Optional[cute.Tensor] = None
+    # Parallel split-K: all splits store partials to their own workspace slice with no
+    # inter-CTA synchronization; a separate reduce kernel sums them and runs the epilogue.
+    splitk_parallel: cutlass.Constexpr[bool] = False
 
 
 @dataclass
@@ -78,6 +83,7 @@ class TileSchedulerArguments:
     split_k: Int32 = Int32(1)
     splitk_flags: Optional[cute.Pointer] = None
     splitk_ws: Optional[cute.Tensor] = None
+    splitk_parallel: cutlass.Constexpr[bool] = False
     persistence_mode: cutlass.Constexpr[PersistenceMode] = PersistenceMode.NONE
 
 
@@ -105,6 +111,7 @@ class TileScheduler:
         split_k_fdd: FastDivmod
         splitk_flags: Optional[cute.Pointer]
         splitk_ws: Optional[cute.Tensor]
+        splitk_parallel: cutlass.Constexpr[bool]
         cluster_shape_mn: cutlass.Constexpr[cute.Shape]
         persistence_mode: cutlass.Constexpr[PersistenceMode]
 
@@ -113,11 +120,16 @@ class TileScheduler:
         def create(args: TileSchedulerArguments, *, loc=None, ip=None) -> "TileScheduler.Params":
             assert args.cluster_shape_mnk[2] == 1
             if const_expr(args.splitk_ws is not None):
-                assert args.splitk_flags is not None
-                # Forward progress of the turnstile requires that a work unit only ever
-                # waits on units with smaller work index; STATIC/DYNAMIC persistence hand
-                # out work indices in increasing order per CTA, CLC/NONE do not guarantee
-                # any ordering.
+                if const_expr(args.splitk_parallel):
+                    # No inter-CTA synchronization in parallel mode, so no flags.
+                    assert args.splitk_flags is None
+                else:
+                    assert args.splitk_flags is not None
+                # Serial mode: forward progress of the turnstile requires that a work unit
+                # only ever waits on units with smaller work index; STATIC/DYNAMIC hand out
+                # work indices in increasing order per CTA, CLC/NONE do not guarantee any
+                # ordering. Parallel mode has no waits but its split work-index expansion
+                # is only wired up for the STATIC/DYNAMIC grid math.
                 assert args.persistence_mode in (PersistenceMode.STATIC, PersistenceMode.DYNAMIC), (
                     "split-K requires STATIC or DYNAMIC persistence"
                 )
@@ -163,6 +175,7 @@ class TileScheduler:
                 FastDivmod(args.split_k),
                 args.splitk_flags if const_expr(args.splitk_ws is not None) else None,
                 args.splitk_ws,
+                args.splitk_parallel,
                 cluster_shape_mn,
                 args.persistence_mode,
             )

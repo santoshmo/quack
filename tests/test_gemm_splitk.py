@@ -1,9 +1,12 @@
-"""Split-K GEMM with turnstile reduction (SM100 only).
+"""Split-K GEMM (SM100 only).
 
 Each output tile is computed by `split_k` work units covering disjoint K ranges.
-Non-final splits serialize their fp32 partial accumulators into a gmem workspace
-through a per-tile turnstile counter (deterministic, k-ascending order); the final
-split adds the accumulated partials and runs the regular epilogue.
+Two reduction modes, both run-to-run deterministic:
+- "parallel" (default): every split stores fp32 partials to its own workspace slice
+  with no inter-CTA synchronization; a separate reduce kernel sums the slices in
+  fixed ascending order and applies the epilogue (cuBLAS splitKreduce-style).
+- "serial": fused in-kernel turnstile reduction; non-final splits serialize their
+  partials into a shared slot (k-ascending) and the final split runs the epilogue.
 """
 
 import math
@@ -20,9 +23,10 @@ pytestmark = pytest.mark.skipif(
 
 ATOL = {torch.bfloat16: 3e-2, torch.float16: 1e-2}
 RTOL = 1e-3
+MODES = ["parallel", "serial"]
 
 
-def _run_gemm(A, B, D, split_k, tile_mn=(128, 128), cluster_mn=(1, 1), **kwargs):
+def _run_gemm(A, B, D, split_k, mode, tile_mn=(128, 128), cluster_mn=(1, 1), **kwargs):
     quack_gemm(
         A,
         B,
@@ -35,6 +39,7 @@ def _run_gemm(A, B, D, split_k, tile_mn=(128, 128), cluster_mn=(1, 1), **kwargs)
         cluster_N=cluster_mn[1],
         persistent=True,
         split_k=split_k,
+        split_k_mode=mode,
         **kwargs,
     )
 
@@ -50,45 +55,60 @@ def _make_inputs(l, m, n, k, dtype):
 # ── Correctness vs fp32 reference ────────────────────────────────────────────
 
 
+@pytest.mark.parametrize("mode", MODES)
 @pytest.mark.parametrize("split_k", [1, 2, 3, 4, 8])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 # K values exercise both divisible and ragged k-tile counts per split
 @pytest.mark.parametrize(
     "m,n,k,l", [(128, 128, 16384, 1), (256, 384, 8192, 1), (128, 256, 4160, 3)]
 )
-def test_gemm_splitk(m, n, k, l, dtype, split_k):
+def test_gemm_splitk(m, n, k, l, dtype, split_k, mode):
     A, B, D = _make_inputs(l, m, n, k, dtype)
-    _run_gemm(A, B, D, split_k)
+    _run_gemm(A, B, D, split_k, mode)
+    ref = torch.bmm(A.float(), B.float().mT).to(dtype)
+    torch.testing.assert_close(D, ref, atol=ATOL[dtype], rtol=RTOL)
+
+
+# Parallel mode is the one whose split count can scale to fill the GPU
+@pytest.mark.parametrize("split_k", [16, 64])
+def test_gemm_splitk_parallel_large_split(split_k):
+    dtype = torch.bfloat16
+    A, B, D = _make_inputs(1, 128, 128, 16384, dtype)
+    _run_gemm(A, B, D, split_k, "parallel")
     ref = torch.bmm(A.float(), B.float().mT).to(dtype)
     torch.testing.assert_close(D, ref, atol=ATOL[dtype], rtol=RTOL)
 
 
 # Edge output tiles (M/N not divisible by the tile shape): OOB lanes round-trip
-# through the workspace and must be predicated away only by the final epilogue.
+# through the workspace and must be predicated away only by the final epilogue
+# (serial) / the reduce kernel (parallel).
+@pytest.mark.parametrize("mode", MODES)
 @pytest.mark.parametrize("split_k", [2, 4])
-def test_gemm_splitk_edge_tiles(split_k):
+def test_gemm_splitk_edge_tiles(split_k, mode):
     dtype = torch.bfloat16
     A, B, D = _make_inputs(2, 192, 320, 8192, dtype)
-    _run_gemm(A, B, D, split_k)
+    _run_gemm(A, B, D, split_k, mode)
     ref = torch.bmm(A.float(), B.float().mT).to(dtype)
     torch.testing.assert_close(D, ref, atol=ATOL[dtype], rtol=RTOL)
 
 
 # split_k larger than the number of k tiles: some splits own zero k tiles and must
-# contribute zeros through the turnstile.
-def test_gemm_splitk_more_splits_than_k_tiles():
+# contribute zeros.
+@pytest.mark.parametrize("mode", MODES)
+def test_gemm_splitk_more_splits_than_k_tiles(mode):
     dtype = torch.bfloat16
     A, B, D = _make_inputs(1, 128, 128, 128, dtype)
-    _run_gemm(A, B, D, split_k=8)
+    _run_gemm(A, B, D, 8, mode)
     ref = torch.bmm(A.float(), B.float().mT).to(dtype)
     torch.testing.assert_close(D, ref, atol=ATOL[dtype], rtol=RTOL)
 
 
+@pytest.mark.parametrize("mode", MODES)
 @pytest.mark.parametrize("split_k", [2, 4])
-def test_gemm_splitk_cluster(split_k):
+def test_gemm_splitk_cluster(split_k, mode):
     dtype = torch.bfloat16
     A, B, D = _make_inputs(1, 256, 256, 16384, dtype)
-    _run_gemm(A, B, D, split_k, cluster_mn=(2, 1))
+    _run_gemm(A, B, D, split_k, mode, cluster_mn=(2, 1))
     ref = torch.bmm(A.float(), B.float().mT).to(dtype)
     torch.testing.assert_close(D, ref, atol=ATOL[dtype], rtol=RTOL)
 
@@ -96,38 +116,41 @@ def test_gemm_splitk_cluster(split_k):
 # ── Epilogue ops must apply to the fully reduced accumulator ─────────────────
 
 
+@pytest.mark.parametrize("mode", MODES)
 @pytest.mark.parametrize("split_k", [2, 4])
-def test_gemm_splitk_alpha_beta_C(split_k):
+def test_gemm_splitk_alpha_beta_C(split_k, mode):
     dtype = torch.bfloat16
     l, m, n, k = 2, 128, 256, 8192
     A, B, D = _make_inputs(l, m, n, k, dtype)
     C = torch.randn(l, m, n, dtype=dtype, device="cuda")
     alpha, beta = 0.5, 0.7
-    _run_gemm(A, B, D, split_k, C=C, alpha=alpha, beta=beta)
+    _run_gemm(A, B, D, split_k, mode, C=C, alpha=alpha, beta=beta)
     ref = (alpha * torch.bmm(A.float(), B.float().mT) + beta * C.float()).to(dtype)
     torch.testing.assert_close(D, ref, atol=ATOL[dtype], rtol=RTOL)
 
 
+@pytest.mark.parametrize("mode", MODES)
 @pytest.mark.parametrize("split_k", [2, 4])
-def test_gemm_splitk_bias(split_k):
+def test_gemm_splitk_bias(split_k, mode):
     dtype = torch.bfloat16
     l, m, n, k = 2, 128, 256, 8192
     A, B, D = _make_inputs(l, m, n, k, dtype)
     bias = torch.randn(l, n, dtype=dtype, device="cuda")
-    _run_gemm(A, B, D, split_k, rowvec_bias=bias)
+    _run_gemm(A, B, D, split_k, mode, rowvec_bias=bias)
     ref = (torch.bmm(A.float(), B.float().mT) + bias.float().unsqueeze(1)).to(dtype)
     torch.testing.assert_close(D, ref, atol=ATOL[dtype], rtol=RTOL)
 
 
-# ── Determinism: the point of the turnstile vs atomic reduction ──────────────
+# ── Determinism: the point of split-K with an ordered reduction ──────────────
 
 
+@pytest.mark.parametrize("mode", MODES)
 @pytest.mark.parametrize("split_k", [4, 8])
-def test_gemm_splitk_deterministic(split_k):
+def test_gemm_splitk_deterministic(split_k, mode):
     dtype = torch.bfloat16
     A, B, D1 = _make_inputs(1, 128, 256, 16384, dtype)
     D2 = torch.empty_like(D1)
-    _run_gemm(A, B, D1, split_k)
+    _run_gemm(A, B, D1, split_k, mode)
     for _ in range(5):
-        _run_gemm(A, B, D2, split_k)
-        assert torch.equal(D1, D2), "split-K turnstile reduction must be run-to-run deterministic"
+        _run_gemm(A, B, D2, split_k, mode)
+        assert torch.equal(D1, D2), "split-K reduction must be run-to-run deterministic"

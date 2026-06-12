@@ -20,6 +20,7 @@ from quack.gemm_default_epi import (
     GemmDefaultSm120,
 )
 from quack.rounding import RoundingMode
+from quack.gemm_splitk_reduce import compile_splitk_reduce, splitk_reduce
 from quack.gemm_tvm_ffi_utils import (
     get_majors,
     get_dtypes,
@@ -65,6 +66,7 @@ def _compile_gemm(
     sr_seed_mode,
     has_trace_ptr,
     has_splitk=False,
+    splitk_parallel=False,
 ):
     sm_to_cls = {
         9: GemmDefaultSm90,
@@ -117,6 +119,7 @@ def _compile_gemm(
         has_batch_idx_permute,
         l,
         has_split_k=has_splitk,
+        splitk_parallel=splitk_parallel,
     )
     aidx_len = m if varlen_m else (k if varlen_k else None)
     varlen_args = make_fake_varlen_args(varlen_m, varlen_k, gather_A, aidx_len)
@@ -171,7 +174,12 @@ def gemm(
     sr_seed: int | Tensor = 0,
     use_tma_gather: bool = False,
     concat_layout: dict | None = None,
-    split_k: int = 1,  # number of K splits per output tile (turnstile reduction, SM100 only)
+    split_k: int = 1,  # number of K splits per output tile (SM100 only)
+    # "parallel": every split writes its own fp32 workspace slice, a second kernel
+    # reduces them (cuBLAS-style; split_k can scale to fill the GPU). "serial": fused
+    # in-kernel turnstile reduction (single kernel, but reduction cost grows with
+    # split_k). Both are run-to-run deterministic.
+    split_k_mode: str = "parallel",
     trace_ptr=None,  # Optional Int64 from TraceSession.ptr
 ) -> None:
     varlen_m = cu_seqlens_m is not None
@@ -205,15 +213,24 @@ def gemm(
         )
 
     assert split_k >= 1, "split_k must be >= 1"
+    assert split_k_mode in ("serial", "parallel"), "split_k_mode must be 'serial' or 'parallel'"
+    splitk_parallel = split_k > 1 and split_k_mode == "parallel"
     if split_k > 1:
         assert device_capacity[0] in (10, 11), "split_k > 1 is only supported on SM100"
         assert not varlen and not gather_A, "split_k > 1 does not support varlen/gather_A"
         assert not add_to_output, "split_k > 1 does not support add_to_output"
         assert tile_M != 256, "split_k > 1 does not support 2-CTA tiles (tile_M=256)"
         assert persistent, "split_k > 1 requires the persistent scheduler"
-        # CLC persistence hands out work in no guaranteed order, which breaks the
-        # turnstile's forward-progress invariant; force the static persistent scheduler.
+        # The split work-index expansion is only wired for the static/dynamic persistent
+        # scheduler (and the serial turnstile additionally needs its ordered work handout).
         is_dynamic_persistent = False
+        if splitk_parallel:
+            assert rounding_mode == RoundingMode.RN, (
+                "parallel split-K converts in the reduce kernel (RN only)"
+            )
+            assert colvec_bias is None or colvec_bias.ndim == 2, (
+                "parallel split-K supports only (L, M) colvec bias"
+            )
 
     A_p, B_p, D_p, C_p = perm3d(A, B, D, C, varlen_m=varlen_m, varlen_k=varlen_k)
     a_major, b_major, d_major, c_major = get_majors(A_p, B_p, D_p, C_p)
@@ -227,25 +244,32 @@ def gemm(
     sr_seed_mode = (
         2 if isinstance(sr_seed, Tensor) else (1 if rounding_mode == RoundingMode.RS else 0)
     )
+    # Parallel split-K: the GEMM kernel only writes fp32 partials; D/C and every
+    # epilogue op (alpha/beta/bias) move to the reduce kernel, so the GEMM is compiled
+    # without them (no D TMA atoms / epi smem -> more mainloop stages).
     compiled_fn = _compile_gemm(
         a_dtype,
         b_dtype,
-        d_dtype,
-        c_dtype,
+        None if splitk_parallel else d_dtype,
+        None if splitk_parallel else c_dtype,
         a_major,
         b_major,
-        d_major,
-        c_major,
+        None if splitk_parallel else d_major,
+        None if splitk_parallel else c_major,
         (tile_M, tile_N),
         (cluster_M, cluster_N, 1),
         pingpong,
         persistent,
         is_dynamic_persistent,
-        torch2cute_dtype_map[rowvec_bias.dtype] if rowvec_bias is not None else None,
-        torch2cute_dtype_map[colvec_bias.dtype] if colvec_bias is not None else None,
-        colvec_ndim,
-        alpha_mode,
-        beta_mode,
+        torch2cute_dtype_map[rowvec_bias.dtype]
+        if rowvec_bias is not None and not splitk_parallel
+        else None,
+        torch2cute_dtype_map[colvec_bias.dtype]
+        if colvec_bias is not None and not splitk_parallel
+        else None,
+        0 if splitk_parallel else colvec_ndim,
+        0 if splitk_parallel else alpha_mode,
+        0 if splitk_parallel else beta_mode,
         add_to_output,
         concat_layout,
         varlen_m,
@@ -258,7 +282,11 @@ def gemm(
         sr_seed_mode,
         trace_ptr is not None,
         split_k > 1,
+        splitk_parallel,
     )
+    if splitk_parallel:
+        # Pre-compile the reduce kernel too, so COMPILE_ONLY (AOT) flows cache both.
+        compile_splitk_reduce(D_p, C_p, alpha, beta, rowvec_bias, colvec_bias, tile_M, tile_N)
 
     from quack.cache_utils import COMPILE_ONLY
 
@@ -280,18 +308,21 @@ def gemm(
         l = A.shape[0] if A.ndim == 3 else 1
         m, n = A.shape[-2], B.shape[-2]
         num_tiles = ((m + tile_M - 1) // tile_M) * ((n + tile_N - 1) // tile_N) * l
-        ws_numel = num_tiles * tile_M * tile_N
+        # Parallel mode: one slot per (tile, split), summed by the reduce kernel.
+        # Serial mode: one accumulation slot per tile, plus zeroed turnstile counters.
+        # The workspace itself never needs initialization in either mode.
+        ws_numel = num_tiles * tile_M * tile_N * (split_k if splitk_parallel else 1)
         assert ws_numel < 2**31, "split-K workspace indexing is 32-bit"
-        # Turnstile counters must start at zero; the f32 partials workspace needs no
-        # initialization (split 0 stores rather than accumulates).
-        splitk_flags = torch.zeros(num_tiles, dtype=torch.int32, device=A.device)
+        if not splitk_parallel:
+            splitk_flags = torch.zeros(num_tiles, dtype=torch.int32, device=A.device)
         splitk_ws = torch.empty(ws_numel, dtype=torch.float32, device=A.device)
 
+    # In parallel split-K, D/C/alpha/beta/bias belong to the reduce kernel, not the GEMM
     epi_args = GemmDefaultEpiMixin.EpilogueArguments(
-        alpha=scalar_arg(alpha, alpha_mode),
-        beta=scalar_arg(beta, beta_mode),
-        mRowVecBroadcast=rowvec_bias,
-        mColVecBroadcast=colvec_bias,
+        alpha=scalar_arg(alpha, alpha_mode) if not splitk_parallel else None,
+        beta=scalar_arg(beta, beta_mode) if not splitk_parallel else None,
+        mRowVecBroadcast=rowvec_bias if not splitk_parallel else None,
+        mColVecBroadcast=colvec_bias if not splitk_parallel else None,
         add_to_output=None,
         rounding_mode=None,
         sr_seed=scalar_arg(sr_seed, sr_seed_mode, dtype=Int32),
@@ -304,12 +335,29 @@ def gemm(
         split_k=split_k,
         splitk_flags=splitk_flags,
         splitk_ws=splitk_ws,
+        splitk_parallel=splitk_parallel,
     )
     varlen_args = make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx)
 
+    gemm_D_p = D_p if not splitk_parallel else None
+    gemm_C_p = C_p if not splitk_parallel else None
     if device_capacity[0] in [10, 11]:
         compiled_fn(
-            A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, None, None, trace_ptr
+            A_p,
+            B_p,
+            gemm_D_p,
+            gemm_C_p,
+            epi_args,
+            scheduler_args,
+            varlen_args,
+            None,
+            None,
+            trace_ptr,
         )
     else:
-        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, trace_ptr)
+        compiled_fn(A_p, B_p, gemm_D_p, gemm_C_p, epi_args, scheduler_args, varlen_args, trace_ptr)
+    if splitk_parallel:
+        # Deterministic parallel reduction of the per-split partials + epilogue
+        splitk_reduce(
+            splitk_ws, D_p, C_p, alpha, beta, rowvec_bias, colvec_bias, split_k, tile_M, tile_N
+        )

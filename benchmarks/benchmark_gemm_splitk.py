@@ -70,8 +70,11 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Split-K GEMM benchmark using quack.gemm.gemm()")
     p.add_argument("--shapes", type=_parse_shapes, default=_DEFAULT_SHAPES,
                    help="';'-separated m,n,k,l tuples. Default: a K-heavy sweep + a large square.")
-    p.add_argument("--split_k", type=_parse_ints, default=(1, 2, 4, 8),
+    p.add_argument("--split_k", type=_parse_ints, default=(1, 2, 4, 8, 16, 32),
                    help="Comma-separated split factors to sweep (must include 1 for the baseline).")
+    p.add_argument("--split_k_mode", type=str, default="parallel", choices=["parallel", "serial"],
+                   help="parallel: per-split workspace slices + separate reduce kernel "
+                        "(cuBLAS-style); serial: fused in-kernel turnstile reduction.")
     p.add_argument("--tile_shape_mn", type=_parse_ints, default=(128, 128),
                    help="CTA tile (tile_M,tile_N). split_k>1 requires tile_M != 256.")
     p.add_argument("--cluster_shape_mn", type=_parse_ints, default=(1, 1), help="Cluster (M,N).")
@@ -87,7 +90,7 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def run_shape(m, n, k, l, *, split_ks, tile_M, tile_N, cluster_M, cluster_N, dtype,
+def run_shape(m, n, k, l, *, split_ks, split_k_mode, tile_M, tile_N, cluster_M, cluster_N, dtype,
               warmup, rep, skip_ref_check) -> None:
     device = "cuda"
     torch.manual_seed(0)
@@ -119,7 +122,7 @@ def run_shape(m, n, k, l, *, split_ks, tile_M, tile_N, cluster_M, cluster_N, dty
             quack_gemm(
                 A, B, D, C=None, tile_count_semaphore=None,
                 tile_M=tile_M, tile_N=tile_N, cluster_M=cluster_M, cluster_N=cluster_N,
-                persistent=True, split_k=sk,
+                persistent=True, split_k=sk, split_k_mode=split_k_mode,
             )
 
         if not skip_ref_check:
@@ -154,12 +157,14 @@ def main() -> None:
     cluster_M, cluster_N = args.cluster_shape_mn
     print(
         f"Split-K GEMM benchmark | tile={tile_M}x{tile_N} cluster={cluster_M}x{cluster_N} "
-        f"| split_k={list(args.split_k)} | warmup={args.warmup} iters={args.iterations} "
+        f"| split_k={list(args.split_k)} mode={args.split_k_mode} "
+        f"| warmup={args.warmup} iters={args.iterations} "
         f"| ref_check={not args.skip_ref_check}"
     )
     for (m, n, k, l) in args.shapes:
         run_shape(
-            m, n, k, l, split_ks=args.split_k, tile_M=tile_M, tile_N=tile_N,
+            m, n, k, l, split_ks=args.split_k, split_k_mode=args.split_k_mode,
+            tile_M=tile_M, tile_N=tile_N,
             cluster_M=cluster_M, cluster_N=cluster_N, dtype=dtype,
             warmup=args.warmup, rep=args.iterations, skip_ref_check=args.skip_ref_check,
         )

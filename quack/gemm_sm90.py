@@ -1403,6 +1403,7 @@ class GemmSm90:
                 split_k=scheduler_args.split_k,
                 splitk_flags=scheduler_args.splitk_flags,
                 splitk_ws=scheduler_args.splitk_ws,
+                splitk_parallel=scheduler_args.splitk_parallel,
                 persistence_mode=persistence_mode,
             )
         else:
@@ -1456,14 +1457,17 @@ class GemmSm90:
         return Int32(k_tile_start), Int32(k_tile_cnt)
 
     @cute.jit
-    def splitk_tile_slot(
-        self, params, tile_coord_mnkl: cute.Coord, mD_mnl: cute.Tensor
-    ) -> Tuple[cute.Pointer, Int32]:
-        """(turnstile flag pointer, linear output-tile index) for this CTA's tile."""
-        ntile_n = cute.ceil_div(cute.size(mD_mnl, mode=[1]), self.cta_tile_shape_mnk[1])
-        num_l = cute.size(mD_mnl, mode=[2])
-        tile_idx = (tile_coord_mnkl[0] * ntile_n + tile_coord_mnkl[1]) * num_l + tile_coord_mnkl[3]
-        return params.splitk_flags + tile_idx, Int32(tile_idx)
+    def splitk_tile_index(self, tile_coord_mnkl: cute.Coord, mB_nkl: cute.Tensor) -> Int32:
+        """Linear output-tile index for split-K workspace/flag addressing.
+
+        N and L are taken from B (N, K, L) rather than D so that this works in parallel
+        mode, where the GEMM kernel is compiled without D.
+        """
+        ntile_n = cute.ceil_div(cute.size(mB_nkl, mode=[0]), self.cta_tile_shape_mnk[1])
+        num_l = cute.size(mB_nkl, mode=[2])
+        return Int32(
+            (tile_coord_mnkl[0] * ntile_n + tile_coord_mnkl[1]) * num_l + tile_coord_mnkl[3]
+        )
 
     @cute.jit
     def splitk_wait(self, flag_ptr: cute.Pointer, expected: Int32, tidx: Int32) -> None:
