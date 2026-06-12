@@ -335,7 +335,6 @@ def gemm(
         split_k=split_k,
         splitk_flags=splitk_flags,
         splitk_ws=splitk_ws,
-        splitk_parallel=splitk_parallel,
     )
     varlen_args = make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx)
 

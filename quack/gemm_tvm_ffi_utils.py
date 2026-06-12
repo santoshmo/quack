@@ -66,7 +66,6 @@ def make_scheduler_args(
     split_k=1,
     splitk_flags=None,
     splitk_ws=None,
-    splitk_parallel=False,
 ):
     return TileSchedulerOptions(
         max_active_clusters=Int32(max_active_clusters),
@@ -79,7 +78,7 @@ def make_scheduler_args(
         split_k=Int32(split_k),
         splitk_flags=(splitk_flags.data_ptr() if splitk_flags is not None else None),
         splitk_ws=splitk_ws,
-        splitk_parallel=splitk_parallel,
+        splitk_parallel=None,  # Constexpr, pass None at runtime (baked from the fake args)
     )
 
 
