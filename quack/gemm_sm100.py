@@ -2598,8 +2598,13 @@ class GemmSm100(GemmSm90):
 
         # Refine epilogue stages:
         # Calculate remaining smem after allocating for A/B stages and reserved bytes
-        # Add remaining unused smem to epilogue
-        epi_stage += (remaining_bytes - ab_bytes_per_stage * ab_stage) // (epi_bytes_per_stage)
+        # Add remaining unused smem to epilogue.
+        # Parallel split-K compiles the GEMM with no epilogue smem
+        # (epi_bytes_per_stage == 0): A/B already claimed all smem above (epi_bytes
+        # was 0), there are no epilogue stages to refine, and any A/B remainder is
+        # smaller than one A/B stage -- so skip this (otherwise zero-division) step.
+        if const_expr(epi_bytes_per_stage > 0):
+            epi_stage += (remaining_bytes - ab_bytes_per_stage * ab_stage) // epi_bytes_per_stage
         return num_acc_stage, ab_stage, epi_stage, epi_c_stage
 
     @staticmethod
