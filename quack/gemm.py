@@ -20,7 +20,12 @@ from quack.gemm_default_epi import (
     GemmDefaultSm120,
 )
 from quack.rounding import RoundingMode
-from quack.gemm_splitk_reduce import compile_splitk_reduce, splitk_reduce, uniform_splitk_tables
+from quack.gemm_splitk_reduce import (
+    choose_reduce_vec_width,
+    compile_splitk_reduce,
+    splitk_reduce,
+    uniform_splitk_tables,
+)
 from quack.gemm_tvm_ffi_utils import (
     get_majors,
     get_dtypes,
@@ -284,9 +289,21 @@ def gemm(
         split_k > 1,
         splitk_parallel,
     )
+    splitk_num_tiles, splitk_reduce_vw = None, 1
+    if split_k > 1:
+        _l = A.shape[0] if A.ndim == 3 else 1
+        splitk_num_tiles = (
+            ((A.shape[-2] + tile_M - 1) // tile_M) * ((B.shape[-2] + tile_N - 1) // tile_N) * _l
+        )
+        if splitk_parallel:
+            # Reduce vec_width (threads/CTA granularity) depends on the tile count.
+            num_sms = torch.cuda.get_device_properties(A.device).multi_processor_count
+            splitk_reduce_vw = choose_reduce_vec_width(splitk_num_tiles, tile_M, tile_N, num_sms)
     if splitk_parallel:
         # Pre-compile the reduce kernel too, so COMPILE_ONLY (AOT) flows cache both.
-        compile_splitk_reduce(D_p, C_p, alpha, beta, rowvec_bias, colvec_bias, tile_M, tile_N)
+        compile_splitk_reduce(
+            D_p, C_p, alpha, beta, rowvec_bias, colvec_bias, tile_M, tile_N, splitk_reduce_vw
+        )
 
     from quack.cache_utils import COMPILE_ONLY
 
@@ -305,9 +322,7 @@ def gemm(
 
     splitk_flags, splitk_ws, splitk_tables = None, None, None
     if split_k > 1:
-        l = A.shape[0] if A.ndim == 3 else 1
-        m, n = A.shape[-2], B.shape[-2]
-        num_tiles = ((m + tile_M - 1) // tile_M) * ((n + tile_N - 1) // tile_N) * l
+        num_tiles = splitk_num_tiles
         # Parallel mode: one slot per (tile, split), summed by the reduce kernel.
         # Serial mode: one accumulation slot per tile, plus zeroed turnstile counters.
         # The workspace itself never needs initialization in either mode.
@@ -375,4 +390,5 @@ def gemm(
             tile_count,
             tile_M,
             tile_N,
+            splitk_reduce_vw,
         )

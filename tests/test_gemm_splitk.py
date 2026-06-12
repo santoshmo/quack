@@ -162,10 +162,11 @@ def test_gemm_splitk_deterministic(split_k, mode):
 # enumeration are correct independently of the GEMM. The uniform split-K path uses
 # first_slot = tile_idx * split_k (order-independent) and so cannot exercise this; it is
 # the slot-index identity Stream-K will rely on once contributor counts vary per tile.
+@pytest.mark.parametrize("vec_width", [1, 2, 4])
 @pytest.mark.parametrize("d_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("with_C", [False, True])
 @pytest.mark.parametrize("l", [1, 2])
-def test_splitk_reduce_variable_contributors(l, with_C, d_dtype):
+def test_splitk_reduce_variable_contributors(l, with_C, d_dtype, vec_width):
     from quack.gemm_splitk_reduce import splitk_reduce
 
     torch.manual_seed(0)
@@ -204,6 +205,6 @@ def test_splitk_reduce_variable_contributors(l, with_C, d_dtype):
 
     splitk_reduce(
         ws.reshape(-1), D, C, alpha, beta, None, None,
-        tile_first_slot, tile_count, tile_m, tile_n,
+        tile_first_slot, tile_count, tile_m, tile_n, vec_width,
     )
     torch.testing.assert_close(D.float(), ref, atol=ATOL[d_dtype], rtol=RTOL)

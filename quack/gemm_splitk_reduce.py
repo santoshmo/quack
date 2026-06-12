@@ -37,16 +37,14 @@ class SplitKReduce:
 
     # The reduce is latency-bound (per output element it sums `count` slots over HBM at
     # well below peak BW), so throughput scales with the number of outstanding memory
-    # transactions, i.e. the thread count. Maximize it: small CTAs (num_threads=64) and
-    # one element per thread (vec_width=1) give tile_mn reduce threads per tile spread
-    # over many SMs -- measurably faster here than fewer threads with wider vector loads
-    # (V=1 vs 2 vs 4: reduce 8.6/9.8/13.1us at 128x128x65536 sk=32). The unrolled
-    # accumulation below keeps several of each thread's slot loads in flight.
+    # transactions, i.e. the thread count = tile_mn / vec_width per tile. vec_width is
+    # picked per call by choose_reduce_vec_width(): 1 for few output tiles (max threads,
+    # e.g. reduce 8.6/9.8/13.1us at V=1/2/4 for 128x128x65536 sk=32), larger for many
+    # tiles to avoid over-decomposing into too many tiny CTAs. num_threads sets CTA size.
     num_threads = 64
-    vec_width = 1  # fp32 elements per thread (one outstanding load per slot per thread)
 
-    def __init__(self, tile_m: int, tile_n: int):
-        self.tile_m, self.tile_n = tile_m, tile_n
+    def __init__(self, tile_m: int, tile_n: int, vec_width: int = 1):
+        self.tile_m, self.tile_n, self.vec_width = tile_m, tile_n, vec_width
         # A vector never straddles a row of the slot, and chunks tile the slot exactly
         assert tile_n % self.vec_width == 0
         assert (tile_m * tile_n) % (self.num_threads * self.vec_width) == 0
@@ -170,6 +168,7 @@ def _compile_splitk_reduce(
     c_major,
     tile_m,
     tile_n,
+    vec_width,
     alpha_mode,
     beta_mode,
     rowvec_dtype,
@@ -215,7 +214,7 @@ def _compile_splitk_reduce(
     mTileFirstSlot = fake_tensor(Int32, (cute.sym_int(),), leading_dim=0, divisibility=1)
     mTileCount = fake_tensor(Int32, (cute.sym_int(),), leading_dim=0, divisibility=1)
     return cute.compile(
-        SplitKReduce(tile_m, tile_n),
+        SplitKReduce(tile_m, tile_n, vec_width),
         mWS,
         mD,
         mC,
@@ -236,7 +235,7 @@ def _scalar_modes(alpha, beta):
     return alpha_mode, beta_mode
 
 
-def compile_splitk_reduce(D, C, alpha, beta, rowvec, colvec, tile_m, tile_n):
+def compile_splitk_reduce(D, C, alpha, beta, rowvec, colvec, tile_m, tile_n, vec_width):
     """Compile (or fetch from cache) the reduce kernel for these tensor properties."""
     alpha_mode, beta_mode = _scalar_modes(alpha, beta)
     return _compile_splitk_reduce(
@@ -246,11 +245,32 @@ def compile_splitk_reduce(D, C, alpha, beta, rowvec, colvec, tile_m, tile_n):
         ("n" if C.stride(1) == 1 else "m") if C is not None else None,
         tile_m,
         tile_n,
+        vec_width,
         alpha_mode,
         beta_mode,
         torch2cute_dtype_map[rowvec.dtype] if rowvec is not None else None,
         torch2cute_dtype_map[colvec.dtype] if colvec is not None else None,
     )
+
+
+def choose_reduce_vec_width(num_tiles: int, tile_m: int, tile_n: int, num_sms: int) -> int:
+    """fp32 elements per reduce thread. The reduce is latency-bound, so fewer elements ->
+    more threads (tile_mn/V per tile) -> better latency hiding; but too few over-decomposes
+    into many tiny CTAs (num_tiles * tile_mn / (num_threads*V)) whose launch/scheduling
+    overhead shows when the reduce isn't the bottleneck (many output tiles). Pick the
+    smallest valid V whose total reduce-CTA count stays within ~8 GPU waves; else the
+    largest valid V. (Few tiles -> V=1, max threads; many tiles -> larger V, fewer CTAs.)"""
+    nt = SplitKReduce.num_threads
+    tile_mn = tile_m * tile_n
+    cta_cap = max(1, num_sms) * 8
+    best = 1
+    for V in (1, 2, 4):
+        if tile_n % V != 0 or tile_mn % (nt * V) != 0:
+            continue
+        best = V  # largest valid so far (fallback when none fit the cap)
+        if num_tiles * (tile_mn // (nt * V)) <= cta_cap:
+            return V
+    return best
 
 
 _uniform_tables_cache: dict = {}
@@ -284,8 +304,11 @@ def splitk_reduce(
     tile_count: Tensor,  # (num_tiles,) i32
     tile_m: int,
     tile_n: int,
+    vec_width: int = 1,
 ) -> None:
-    compiled_fn = compile_splitk_reduce(D, C, alpha, beta, rowvec, colvec, tile_m, tile_n)
+    compiled_fn = compile_splitk_reduce(
+        D, C, alpha, beta, rowvec, colvec, tile_m, tile_n, vec_width
+    )
 
     from quack.cache_utils import COMPILE_ONLY
 
