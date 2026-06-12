@@ -31,7 +31,11 @@ class SplitKReduce:
     padded inside the slot; this kernel predicates the final D store by (M, N).
     """
 
-    num_threads = 256
+    # Small CTAs so a tile splits into many reduce CTAs (num_chunks = tile_mn/(64*4),
+    # e.g. 64 for a 128x128 tile vs 16 at 256 threads). Once the unrolled accumulation
+    # below hides per-thread load latency, spreading the reduce across more SMs pulls
+    # more HBM bandwidth -- at high split_k this is measurably faster than 256 threads.
+    num_threads = 64
     vec_width = 4  # fp32 elements per vectorized workspace load (16B)
 
     def __init__(self, tile_m: int, tile_n: int):
@@ -104,10 +108,13 @@ class SplitKReduce:
 
         rAcc = cute.make_rmem_tensor(V, Float32)
         flat = (chunk * self.num_threads + tidx) * V
-        # Sum the split slices in fixed ascending order (deterministic)
+        # Sum the split slices in fixed ascending order (deterministic). The reduce is
+        # latency- not bandwidth-bound (few threads per output element), so unroll the
+        # accumulation: the slice loads are independent and issue ahead, keeping many
+        # loads in flight per thread. Unrolling preserves the add order (numerics).
         tWS = cute.make_tensor(slot_base + flat, cute.make_layout(V))
         cute.autovec_copy(tWS, rAcc)
-        for s in cutlass.range(1, split_k, unroll=1):
+        for s in cutlass.range(1, split_k, unroll=8):
             tWS_s = cute.make_tensor(slot_base + s * tile_mn + flat, cute.make_layout(V))
             rAcc.store(rAcc.load() + tWS_s.load())
         # The vector spans one row of the slot (tile_n % V == 0)
